@@ -1,0 +1,160 @@
+# Расчёт MAU авторов(Вывести имена топ-3 авторов с наибольшим MAU в ноябре и сами значения MAU.)
+WITH
+author as(
+    SELECT auth.main_author_name as main_author_name,
+          con.main_content_id  
+    FROM bookmate.author as auth
+    LEFT JOIN bookmate.content as con USING(main_author_id)
+),
+allinfo as (SELECT a.main_author_name,
+       EXTRACT(MONTH FROM aud.msk_business_dt_str::date) as month,
+       aud.puid
+FROM author as a
+LEFT JOIN bookmate.audition as aud USING(main_content_id))
+
+SELECT main_author_name,
+        count(distinct puid) as mau
+FROM allinfo
+WHERE month = 11
+GROUP BY main_author_name
+ORDER BY count(distinct puid) Desc
+LIMIT 3;
+
+#Расчёт MAU произведений(Вывести имена топ-3 произведений с наибольшим MAU в ноябре, а также списки жанров этих произведений, их авторов и сами значения MAU)
+WITH
+content_month AS(
+    SELECT con.main_content_id, puid,
+           EXTRACT(MONTH FROM aud.msk_business_dt_str::date) as month
+    FROM bookmate.content as con
+    LEFT JOIN bookmate.audition as aud USING(main_content_id)
+),
+mau_content_11 as(
+    SELECT main_content_id,
+           COUNT(DISTINCT puid) as mau
+    FROM content_month
+    WHERE month = 11
+    GROUP BY main_content_id
+    ORDER BY COUNT(DISTINCT puid) DESC
+    LIMIT 3
+),
+info as(
+        SELECT main_content_id,
+                main_content_name,
+                published_topic_title_list, 
+                main_author_name
+        FROM bookmate.content
+        JOIN bookmate.author using(main_author_id)
+)
+SELECT i.main_content_name,
+       i.published_topic_title_list, 
+       i.main_author_name,
+       mc11.mau
+FROM mau_content_11 as mc11
+LEFT JOIN info as i using(main_content_id)
+ORDER BY mc11.mau DESC;
+
+#Расчёт Retention Rate
+
+WITH cohort_base AS (
+    SELECT 
+        day_since_install,
+        COUNT(DISTINCT puid) as retained_users,
+        MAX(CASE WHEN day_since_install = 0 THEN COUNT(DISTINCT puid) END) OVER () as cohort_size
+    FROM (
+        SELECT 
+            aud.puid,
+            (aud.msk_business_dt_str::date - '2024-12-02'::date) as day_since_install
+        FROM bookmate.audition aud
+        WHERE aud.puid IN (
+            SELECT DISTINCT puid 
+            FROM bookmate.audition 
+            WHERE msk_business_dt_str::date = '2024-12-02'
+        )
+        AND aud.msk_business_dt_str::date BETWEEN '2024-12-02' AND '2024-12-11'
+    ) cohort_activity
+    WHERE day_since_install >= 0
+    GROUP BY day_since_install
+)
+SELECT 
+    day_since_install,
+    retained_users,
+    ROUND((retained_users*1.0 / cohort_size), 2) as retention_rate
+FROM cohort_base
+ORDER BY day_since_install ASC;
+
+#Расчёт LTV для пользователей в Москве и Санкт-Петербурге
+WITH user_activity AS (
+    SELECT
+        a.puid,
+        g.usage_geo_id_name AS city,
+        DATE_TRUNC('month', a.msk_business_dt_str::DATE) AS activity_month
+    FROM
+        bookmate.audition a
+    JOIN
+        bookmate.geo g ON a.usage_geo_id = g.usage_geo_id
+    WHERE
+        g.usage_geo_id_name IN ('Москва', 'Санкт-Петербург')
+),
+user_months AS (
+    SELECT
+        city,
+        puid,
+        COUNT(DISTINCT activity_month) AS active_months
+    FROM
+        user_activity
+    GROUP BY
+        city, puid
+),
+city_revenue AS (
+    SELECT
+        city,
+        COUNT(DISTINCT puid) AS total_users,
+        SUM(active_months) * 399 AS total_revenue
+    FROM
+        user_months
+    GROUP BY
+        city
+)
+SELECT
+    city,
+    total_users,
+    ROUND((total_revenue::NUMERIC / total_users), 2) AS ltv
+FROM
+    city_revenue
+ORDER BY
+    city;
+
+#Расчёт средней выручки прослушанного часа — аналог среднего чека
+WITH monthly_activity AS (
+    SELECT
+        DATE_TRUNC('month', msk_business_dt_str::DATE) AS month,
+        puid,
+        SUM(hours) AS total_hours
+    FROM
+        bookmate.audition
+    WHERE
+        DATE(msk_business_dt_str) BETWEEN '2024-09-01' AND '2024-11-30'
+    GROUP BY
+        month, puid
+),
+
+monthly_metrics AS (
+    SELECT
+        month,
+        COUNT(DISTINCT puid) AS mau,
+        SUM(total_hours) AS hours
+    FROM
+        monthly_activity
+    GROUP BY
+        month
+)
+
+SELECT
+    DATE(month),
+    mau,
+    ROUND(hours, 2) AS hours,
+    ROUND((mau * 399.0) / NULLIF(hours, 0), 2) AS avg_hour_rev
+FROM
+    monthly_metrics
+ORDER BY
+    month;
